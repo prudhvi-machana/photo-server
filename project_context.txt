@@ -1,0 +1,747 @@
+========================================
+PHOTO SERVER - PROJECT CONTEXT
+Generated: Wed Aug 19 02:20:48 AM IST 2026
+========================================
+
+PROJECT STRUCTURE
+=================
+.
+├── alembic
+│   ├── env.py
+│   ├── README
+│   ├── script.py.mako
+│   └── versions
+│       └── c6e1c237edbe_add_photos_table.py
+├── alembic.ini
+├── app
+│   ├── api
+│   │   ├── __init__.py
+│   │   └── photos.py
+│   ├── auth
+│   │   ├── dependencies.py
+│   │   ├── __init__.py
+│   │   ├── jwt.py
+│   │   ├── password.py
+│   │   └── routes.py
+│   ├── db
+│   │   ├── database.py
+│   │   ├── __init__.py
+│   │   └── models.py
+│   ├── __init__.py
+│   └── main.py
+├── downloaded_real.jpg
+├── Lord_venkatesa.jpg
+├── main.py
+├── project_context.sh
+├── project_context.txt
+└── .Trash-1000
+    ├── files
+    │   ├── test2.jpg
+    │   └── test.jpg
+    └── info
+        ├── test2.jpg.trashinfo
+        └── test.jpg.trashinfo
+
+10 directories, 26 files
+
+SOURCE FILES
+============
+
+----------------------------------------
+--- app/api/__init__.py ---
+----------------------------------------
+
+
+----------------------------------------
+--- app/api/photos.py ---
+----------------------------------------
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+
+from app.auth.dependencies import get_current_user
+from app.db.database import get_db
+from app.db.models import Photo, User
+from app.storage.service import (
+    generate_filename,
+    get_user_storage,
+)
+
+router = APIRouter(prefix="/photos", tags=["Photos"])
+
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+
+@router.get("")
+def list_photos(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    photos = (
+        db.query(Photo)
+        .filter(Photo.user_id == user.id)
+        .order_by(Photo.uploaded_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": photo.id,
+            "filename": photo.filename,
+            "original_filename": photo.original_filename,
+            "mime_type": photo.mime_type,
+            "size": photo.file_size,
+            "uploaded_at": photo.uploaded_at,
+        }
+        for photo in photos
+    ]
+
+@router.get("/{photo_id}")
+def get_photo(
+    photo_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    photo = (
+        db.query(Photo)
+        .filter(
+            Photo.id == photo_id,
+            Photo.user_id == user.id,
+        )
+        .first()
+    )
+
+    if photo is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Photo not found",
+        )
+
+    file_path = get_user_storage(user.id) / photo.filename
+
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Photo file not found",
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type=photo.mime_type,
+        filename=photo.original_filename,
+    )
+
+@router.post("/upload")
+async def upload_photo(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        filename = generate_filename(file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    data = await file.read()
+
+    if len(data) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum size is 20 MB.",
+        )
+
+    storage_dir = get_user_storage(user.id)
+    file_path = storage_dir / filename
+
+    file_path.write_bytes(data)
+
+    photo = Photo(
+        user_id=user.id,
+        filename=filename,
+        original_filename=file.filename or filename,
+        mime_type=file.content_type or "application/octet-stream",
+        file_size=len(data),
+    )
+
+    db.add(photo)
+    db.commit()
+    db.refresh(photo)
+
+    return {
+        "id": photo.id,
+        "filename": photo.filename,
+        "original_filename": photo.original_filename,
+        "mime_type": photo.mime_type,
+        "size": photo.file_size,
+    }
+
+@router.delete("/{photo_id}")
+def delete_photo(
+    photo_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    photo = (
+        db.query(Photo)
+        .filter(
+            Photo.id == photo_id,
+            Photo.user_id == user.id,
+        )
+        .first()
+    )
+
+    if photo is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Photo not found",
+        )
+
+    file_path = get_user_storage(user.id) / photo.filename
+
+    if file_path.is_file():
+        file_path.unlink()
+
+    db.delete(photo)
+    db.commit()
+
+    return {
+        "message": "Photo deleted successfully",
+        "id": photo_id,
+    }
+
+----------------------------------------
+--- app/auth/dependencies.py ---
+----------------------------------------
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+
+import jwt
+
+from app.auth.jwt import SECRET_KEY, ALGORITHM
+from app.db.database import get_db
+from app.db.models import User
+
+security = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    token = credentials.credentials
+
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+        )
+
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token",
+            )
+
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+
+    user = db.query(User).filter(User.id == int(user_id)).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+        )
+
+    return user
+
+
+----------------------------------------
+--- app/auth/__init__.py ---
+----------------------------------------
+
+
+----------------------------------------
+--- app/auth/jwt.py ---
+----------------------------------------
+import os
+from datetime import datetime, timedelta, timezone
+
+import jwt
+
+SECRET_KEY = os.getenv(
+    "JWT_SECRET",
+    "change-this-secret-in-production",
+)
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+
+def create_access_token(user_id: int) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "sub": str(user_id),
+        "exp": expire,
+    }
+
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+----------------------------------------
+--- app/auth/password.py ---
+----------------------------------------
+from argon2 import PasswordHasher
+
+password_hasher = PasswordHasher()
+
+
+def hash_password(password: str) -> str:
+    return password_hasher.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        password_hasher.verify(password_hash, password)
+        return True
+    except Exception:
+        return False
+
+
+----------------------------------------
+--- app/auth/routes.py ---
+----------------------------------------
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.auth.password import hash_password
+from app.db.database import get_db
+from app.db.models import User
+from app.auth.jwt import create_access_token
+from app.auth.password import verify_password
+from app.auth.dependencies import get_current_user
+
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/register")
+def register(
+    data: RegisterRequest,
+    db: Session = Depends(get_db),
+):
+    existing_user = (
+        db.query(User)
+        .filter(User.username == data.username)
+        .first()
+    )
+
+    if existing_user:
+        raise HTTPException(
+            status_code=409,
+            detail="Username already exists",
+        )
+
+    user = User(
+        username=data.username,
+        password_hash=hash_password(data.password),
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "id": user.id,
+        "username": user.username,
+    }
+
+@router.post("/login")
+def login(
+    data: LoginRequest,
+    db: Session = Depends(get_db),
+):
+    user = (
+        db.query(User)
+        .filter(User.username == data.username)
+        .first()
+    )
+
+    if not user or not verify_password(
+        data.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+
+    token = create_access_token(user.id)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+@router.get("/me")
+def get_me(user: User = Depends(get_current_user)):
+    return {
+        "id": user.id,
+        "username": user.username,
+    }
+
+
+----------------------------------------
+--- app/db/database.py ---
+----------------------------------------
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+
+DATABASE_URL = "sqlite:///./photo_server.db"
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+----------------------------------------
+--- app/db/__init__.py ---
+----------------------------------------
+
+
+----------------------------------------
+--- app/db/models.py ---
+----------------------------------------
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    username: Mapped[str] = mapped_column(
+        String(50),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+
+class Photo(Base):
+    __tablename__ = "photos"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"),
+        nullable=False,
+        index=True,
+    )
+
+    filename: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        unique=True,
+    )
+
+    original_filename: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    mime_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    file_size: Mapped[int] = mapped_column(
+        nullable=False,
+    )
+
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+----------------------------------------
+--- app/__init__.py ---
+----------------------------------------
+
+
+----------------------------------------
+--- app/main.py ---
+----------------------------------------
+from fastapi import FastAPI
+
+from app.auth.routes import router as auth_router
+from app.api.photos import router as photos_router
+from app.db.database import Base, engine
+from app.db import models
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Photo Server")
+
+app.include_router(auth_router)
+app.include_router(photos_router)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+----------------------------------------
+--- app/storage/__init__.py ---
+----------------------------------------
+
+
+----------------------------------------
+--- app/storage/service.py ---
+----------------------------------------
+from pathlib import Path
+from uuid import uuid4
+
+BASE_STORAGE = Path("storage/users")
+
+ALLOWED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",
+}
+
+
+def get_user_storage(user_id: int) -> Path:
+    user_dir = BASE_STORAGE / str(user_id) / "originals"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return user_dir
+
+
+def generate_filename(original_filename: str) -> str:
+    extension = Path(original_filename).suffix.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise ValueError("Unsupported image format")
+
+    return f"{uuid4().hex}{extension}"
+
+
+def get_file_path(user_id: int, filename: str) -> Path:
+    return get_user_storage(user_id) / filename
+
+
+CONFIGURATION
+=============
+
+----------------------------------------
+--- alembic.ini ---
+----------------------------------------
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts.
+# this is typically a path given in POSIX (e.g. forward slashes)
+# format, relative to the token %(here)s which refers to the location of this
+# ini file
+script_location = %(here)s/alembic
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+# Or organize into date-based subdirectories (requires recursive_version_locations = true)
+# file_template = %%(year)d/%%(month).2d/%%(day).2d_%%(hour).2d%%(minute).2d_%%(second).2d_%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.  for multiple paths, the path separator
+# is defined by "path_separator" below.
+prepend_sys_path = .
+
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the tzdata library which can be installed by adding
+# `alembic[tz]` to the pip requirements.
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to <script_location>/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "path_separator"
+# below.
+# version_locations = %(here)s/bar:%(here)s/bat:%(here)s/alembic/versions
+
+# path_separator; This indicates what character is used to split lists of file
+# paths, including version_locations and prepend_sys_path within configparser
+# files such as alembic.ini.
+# The default rendered in new alembic.ini files is "os", which uses os.pathsep
+# to provide os-dependent path splitting.
+#
+# Note that in order to support legacy alembic.ini files, this default does NOT
+# take place if path_separator is not present in alembic.ini.  If this
+# option is omitted entirely, fallback logic is as follows:
+#
+# 1. Parsing of the version_locations option falls back to using the legacy
+#    "version_path_separator" key, which if absent then falls back to the legacy
+#    behavior of splitting on spaces and/or commas.
+# 2. Parsing of the prepend_sys_path option falls back to the legacy
+#    behavior of splitting on spaces, commas, or colons.
+#
+# Valid values for path_separator are:
+#
+# path_separator = :
+# path_separator = ;
+# path_separator = space
+# path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+# database URL.  This is consumed by the user-maintained env.py script only.
+# other means of configuring database URLs may be customized within the env.py
+# file.sqlalchemy.url = driver://user:pass@localhost/dbname
+
+sqlalchemy.url = sqlite:///./photo_server.db
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the module runner, against the "ruff" module
+# hooks = ruff
+# ruff.type = module
+# ruff.module = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Alternatively, use the exec runner to execute a binary found on your PATH
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration.  This is also consumed by the user-maintained
+# env.py script only.
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S

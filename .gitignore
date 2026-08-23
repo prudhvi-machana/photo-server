@@ -1,0 +1,50 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.env
+
+*.db
+*.sqlite
+*.sqlite3
+
+uploads/
+trash/
+
+.pytest_cache/
+.mypy_cache/
+
+.vscode/
+.idea/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment
+.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Photo storage
+storage/
+uploads/
+trash/
+
+# Test/downloaded images
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# IDE
+.vscode/
+.idea/
+
+# Python caches
+.pytest_cache/
+.mypy_cache/
