@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,13 +15,34 @@ from app.db import models
 Base.metadata.create_all(bind=engine)
 
 
+TRASH_CLEANUP_INTERVAL = 24 * 60 * 60  # once per day
+
+
+async def _trash_cleanup_loop():
+    while True:
+        await asyncio.sleep(TRASH_CLEANUP_INTERVAL)
+
+        db: Session = SessionLocal()
+        try:
+            deleted_count = cleanup_expired_trash(db)
+            if deleted_count:
+                print(
+                    f"Trash cleanup: permanently deleted "
+                    f"{deleted_count} expired photo(s)."
+                )
+        except Exception as exc:
+            # A cleanup failure must never bring down the API server.
+            print(f"Trash cleanup failed: {exc}")
+        finally:
+            db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Clean up anything that expired while the server was offline.
     db: Session = SessionLocal()
-
     try:
         deleted_count = cleanup_expired_trash(db)
-
         if deleted_count:
             print(
                 f"Trash cleanup: permanently deleted "
@@ -29,7 +51,16 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    yield
+    cleanup_task = asyncio.create_task(_trash_cleanup_loop())
+
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
