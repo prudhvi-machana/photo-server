@@ -33,6 +33,12 @@ def get_user_storage(user_id: int) -> Path:
     return user_dir
 
 
+def get_user_thumbnail_storage(user_id: int) -> Path:
+    thumbnail_dir = BASE_STORAGE / str(user_id) / "thumbnails"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+    return thumbnail_dir
+
+
 def generate_filename(original_filename: str) -> str:
     extension = Path(original_filename).suffix.lower()
 
@@ -44,6 +50,10 @@ def generate_filename(original_filename: str) -> str:
 
 def get_file_path(user_id: int, filename: str) -> Path:
     return get_user_storage(user_id) / filename
+
+
+def get_thumbnail_path(user_id: int, filename: str) -> Path:
+    return get_user_thumbnail_storage(user_id) / f"{Path(filename).stem}.jpg"
 
 
 def is_video_filename(filename: str) -> bool:
