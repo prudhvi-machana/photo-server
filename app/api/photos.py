@@ -1,24 +1,20 @@
 from io import BytesIO
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select
-
 from PIL import Image
-from datetime import datetime, timedelta
 
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
 from app.db.models import Photo, User
-from app.storage.service import (
-    generate_filename,
-    get_user_storage,
-)
+from app.storage.service import generate_filename, get_user_storage
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+
 
 @router.get("")
 def list_photos(
@@ -27,7 +23,7 @@ def list_photos(
 ):
     photos = (
         db.query(Photo)
-        .filter(Photo.user_id == user.id, Photo.deleted_at.is_(None), )
+        .filter(Photo.user_id == user.id, Photo.deleted_at.is_(None))
         .order_by(Photo.uploaded_at.desc())
         .all()
     )
@@ -44,6 +40,7 @@ def list_photos(
         for photo in photos
     ]
 
+
 @router.get("/recent")
 def list_recent_photos(
     user: User = Depends(get_current_user),
@@ -51,7 +48,7 @@ def list_recent_photos(
 ):
     photos = (
         db.query(Photo)
-        .filter(Photo.user_id == user.id, Photo.deleted_at.is_(None),)
+        .filter(Photo.user_id == user.id, Photo.deleted_at.is_(None))
         .order_by(Photo.uploaded_at.desc())
         .limit(50)
         .all()
@@ -67,59 +64,44 @@ def list_recent_photos(
         for photo in photos
     ]
 
+
 @router.get("/{photo_id}/thumbnail")
 def get_photo_thumbnail(
     photo_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Thumbnails are also needed by the Trash screen, so deliberately do not
+    # filter on deleted_at here. Authorization is still enforced by user_id.
     photo = (
         db.query(Photo)
-        .filter(
-            Photo.id == photo_id,
-            Photo.user_id == user.id,
-            Photo.deleted_at.is_(None),
-        )
+        .filter(Photo.id == photo_id, Photo.user_id == user.id)
         .first()
     )
 
     if photo is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Photo not found",
-        )
+        raise HTTPException(status_code=404, detail="Photo not found")
 
     file_path = get_user_storage(user.id) / photo.filename
 
     if not file_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Photo file not found",
-        )
+        raise HTTPException(status_code=404, detail="Photo file not found")
 
     try:
         image = Image.open(file_path)
         image.thumbnail((400, 400))
-
         output = BytesIO()
 
-        # JPEG gives us small thumbnails suitable for phone grids.
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
 
         image.save(output, format="JPEG", quality=80)
         output.seek(0)
-
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to generate thumbnail",
-        )
+        raise HTTPException(status_code=400, detail="Unable to generate thumbnail")
 
-    return StreamingResponse(
-        output,
-        media_type="image/jpeg",
-    )
+    return StreamingResponse(output, media_type="image/jpeg")
+
 
 @router.get("/trash")
 def list_trash(
@@ -128,10 +110,7 @@ def list_trash(
 ):
     photos = (
         db.query(Photo)
-        .filter(
-            Photo.user_id == user.id,
-            Photo.deleted_at.isnot(None),
-        )
+        .filter(Photo.user_id == user.id, Photo.deleted_at.isnot(None))
         .order_by(Photo.deleted_at.desc())
         .all()
     )
@@ -147,16 +126,13 @@ def list_trash(
             "deleted_at": photo.deleted_at,
             "days_remaining": max(
                 0,
-                30 - (
-                    datetime.utcnow() - photo.deleted_at
-                ).days,
+                30 - (datetime.utcnow() - photo.deleted_at).days,
             ),
-            "thumbnail_url": (
-                f"/photos/{photo.id}/thumbnail"
-            ),
+            "thumbnail_url": f"/photos/{photo.id}/thumbnail",
         }
         for photo in photos
     ]
+
 
 @router.get("/{photo_id}")
 def get_photo(
@@ -175,24 +151,19 @@ def get_photo(
     )
 
     if photo is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Photo not found",
-        )
+        raise HTTPException(status_code=404, detail="Photo not found")
 
     file_path = get_user_storage(user.id) / photo.filename
 
     if not file_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail="Photo file not found",
-        )
+        raise HTTPException(status_code=404, detail="Photo file not found")
 
     return FileResponse(
         path=file_path,
         media_type=photo.mime_type,
         filename=photo.original_filename,
     )
+
 
 @router.post("/trash/{photo_id}/restore")
 def restore_photo(
@@ -211,20 +182,14 @@ def restore_photo(
     )
 
     if photo is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Photo not found in trash",
-        )
+        raise HTTPException(status_code=404, detail="Photo not found in trash")
 
     photo.deleted_at = None
-
     db.commit()
     db.refresh(photo)
 
-    return {
-        "message": "Photo restored successfully",
-        "id": photo.id,
-    }
+    return {"message": "Photo restored successfully", "id": photo.id}
+
 
 @router.delete("/trash/{photo_id}")
 def permanently_delete_photo(
@@ -243,23 +208,17 @@ def permanently_delete_photo(
     )
 
     if photo is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Photo not found in trash",
-        )
+        raise HTTPException(status_code=404, detail="Photo not found in trash")
 
     file_path = get_user_storage(user.id) / photo.filename
-
     if file_path.is_file():
         file_path.unlink()
 
     db.delete(photo)
     db.commit()
 
-    return {
-        "message": "Photo permanently deleted",
-        "id": photo_id,
-    }
+    return {"message": "Photo permanently deleted", "id": photo_id}
+
 
 @router.post("/upload")
 async def upload_photo(
@@ -270,10 +229,7 @@ async def upload_photo(
     try:
         filename = generate_filename(file.filename or "")
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
+        raise HTTPException(status_code=400, detail=str(exc))
 
     data = await file.read()
 
@@ -285,7 +241,6 @@ async def upload_photo(
 
     storage_dir = get_user_storage(user.id)
     file_path = storage_dir / filename
-
     file_path.write_bytes(data)
 
     photo = Photo(
@@ -307,6 +262,8 @@ async def upload_photo(
         "mime_type": photo.mime_type,
         "size": photo.file_size,
     }
+
+
 @router.delete("/{photo_id}")
 def delete_photo(
     photo_id: int,
@@ -324,13 +281,9 @@ def delete_photo(
     )
 
     if photo is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Photo not found",
-        )
+        raise HTTPException(status_code=404, detail="Photo not found")
 
     photo.deleted_at = datetime.utcnow()
-
     db.commit()
 
     return {
@@ -338,6 +291,7 @@ def delete_photo(
         "id": photo_id,
         "deleted_at": photo.deleted_at,
     }
+
 
 def cleanup_expired_trash(db: Session):
     cutoff = datetime.utcnow() - timedelta(days=30)
@@ -363,5 +317,4 @@ def cleanup_expired_trash(db: Session):
         deleted_count += 1
 
     db.commit()
-
     return deleted_count
