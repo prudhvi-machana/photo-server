@@ -9,11 +9,13 @@ from PIL import Image
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
 from app.db.models import Photo, User
-from app.storage.service import generate_filename, get_user_storage
+from app.storage.service import generate_filename, get_user_storage, is_video_filename
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
 
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+# Large media must be streamed to disk instead of loaded into RAM.
+MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 
 @router.get("")
@@ -58,8 +60,14 @@ def list_recent_photos(
         {
             "id": photo.id,
             "original_filename": photo.original_filename,
+            "mime_type": photo.mime_type,
+            "size": photo.file_size,
             "uploaded_at": photo.uploaded_at,
-            "thumbnail_url": f"/photos/{photo.id}/thumbnail",
+            "thumbnail_url": (
+                None
+                if is_video_filename(photo.filename)
+                else f"/photos/{photo.id}/thumbnail"
+            ),
         }
         for photo in photos
     ]
@@ -81,6 +89,12 @@ def get_photo_thumbnail(
 
     if photo is None:
         raise HTTPException(status_code=404, detail="Photo not found")
+
+    if is_video_filename(photo.filename):
+        raise HTTPException(
+            status_code=415,
+            detail="Video thumbnails are not generated yet",
+        )
 
     file_path = get_user_storage(user.id) / photo.filename
 
@@ -128,7 +142,11 @@ def list_trash(
                 0,
                 30 - (datetime.utcnow() - photo.deleted_at).days,
             ),
-            "thumbnail_url": f"/photos/{photo.id}/thumbnail",
+            "thumbnail_url": (
+                None
+                if is_video_filename(photo.filename)
+                else f"/photos/{photo.id}/thumbnail"
+            ),
         }
         for photo in photos
     ]
@@ -231,24 +249,42 @@ async def upload_photo(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    data = await file.read()
-
-    if len(data) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="File too large. Maximum size is 20 MB.",
-        )
-
     storage_dir = get_user_storage(user.id)
     file_path = storage_dir / filename
-    file_path.write_bytes(data)
+    total_size = 0
+
+    try:
+        with file_path.open("wb") as output:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File too large. Maximum size is 1 GB.",
+                    )
+
+                output.write(chunk)
+    except HTTPException:
+        if file_path.is_file():
+            file_path.unlink()
+        raise
+    except Exception:
+        if file_path.is_file():
+            file_path.unlink()
+        raise HTTPException(status_code=500, detail="Failed to store uploaded file")
+    finally:
+        await file.close()
 
     photo = Photo(
         user_id=user.id,
         filename=filename,
         original_filename=file.filename or filename,
         mime_type=file.content_type or "application/octet-stream",
-        file_size=len(data),
+        file_size=total_size,
     )
 
     db.add(photo)
