@@ -103,11 +103,15 @@ def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
 
 
 def media_item(photo: Photo) -> dict:
+    # Older uploads may have been stored as application/octet-stream. Return
+    # the MIME type inferred from the filename so clients can still identify
+    # and play those videos correctly without a database migration.
+    effective_mime = infer_mime_type(photo.original_filename, photo.mime_type)
     return {
         "id": photo.id,
         "filename": photo.filename,
         "original_filename": photo.original_filename,
-        "mime_type": photo.mime_type,
+        "mime_type": effective_mime,
         "size": photo.file_size,
         "uploaded_at": photo.uploaded_at,
         "thumbnail_url": f"/photos/{photo.id}/thumbnail",
@@ -220,12 +224,10 @@ async def get_photo(
     if not is_video_filename(photo.filename):
         return FileResponse(
             path=file_path,
-            media_type=photo.mime_type,
+            media_type=infer_mime_type(photo.original_filename, photo.mime_type),
             filename=photo.original_filename,
         )
 
-    # Video playback needs byte ranges so Android video_player can seek and
-    # start playback without downloading the entire file first.
     file_size = file_path.stat().st_size
     range_header = request.headers.get("range")
     media_type = infer_mime_type(photo.original_filename, photo.mime_type)
@@ -405,9 +407,6 @@ async def upload_photo(
     db.commit()
     db.refresh(photo)
 
-    # Generate the thumbnail after the original is safely stored. A missing
-    # ffmpeg installation does not make the upload itself fail; the thumbnail
-    # endpoint will retry generation later.
     ensure_thumbnail(photo, user.id)
 
     return media_item(photo)
