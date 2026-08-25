@@ -14,11 +14,9 @@ from app.db.database import get_db
 from app.db.models import Photo, User
 from app.storage.service import (
     generate_filename,
-    get_stream_path,
     get_thumbnail_path,
     get_user_storage,
     is_video_filename,
-    supports_faststart_remux,
 )
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
@@ -71,56 +69,6 @@ def generate_video_thumbnail(video_path: Path, thumbnail_path: Path) -> bool:
         return False
 
 
-def generate_video_stream(video_path: Path, stream_path: Path) -> bool:
-    """Create a playback copy with the MP4 moov atom at the beginning.
-
-    This is a remux only: audio/video are copied without re-encoding, so the
-    original quality is preserved. The original file remains untouched.
-    """
-    stream_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if stream_path.is_file() and stream_path.stat().st_size > 0:
-        return True
-
-    temp_path = stream_path.with_suffix(stream_path.suffix + ".tmp")
-
-    try:
-        if temp_path.is_file():
-            temp_path.unlink()
-
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(video_path),
-                "-map",
-                "0",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(temp_path),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=120,
-            check=False,
-        )
-
-        if result.returncode != 0 or not temp_path.is_file() or temp_path.stat().st_size == 0:
-            if temp_path.is_file():
-                temp_path.unlink()
-            return False
-
-        temp_path.replace(stream_path)
-        return True
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        if temp_path.is_file():
-            temp_path.unlink()
-        return False
-
-
 def generate_image_thumbnail(image_path: Path, thumbnail_path: Path) -> bool:
     try:
         thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,24 +100,6 @@ def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
         return thumbnail_path if generate_video_thumbnail(file_path, thumbnail_path) else None
 
     return thumbnail_path if generate_image_thumbnail(file_path, thumbnail_path) else None
-
-
-def ensure_stream_file(photo: Photo, user_id: int) -> Path | None:
-    """Return an optimized playback file for formats that support faststart."""
-    if not is_video_filename(photo.filename) or not supports_faststart_remux(photo.filename):
-        return get_user_storage(user_id) / photo.filename
-
-    source_path = get_user_storage(user_id) / photo.filename
-    stream_path = get_stream_path(user_id, photo.filename)
-
-    if not source_path.is_file():
-        return None
-
-    if generate_video_stream(source_path, stream_path):
-        return stream_path
-
-    # Playback can still fall back to the original if remuxing fails.
-    return source_path
 
 
 def media_item(photo: Photo) -> dict:
@@ -287,23 +217,20 @@ async def get_photo(
     if photo is None:
         raise HTTPException(status_code=404, detail="Photo not found")
 
+    file_path = get_user_storage(user.id) / photo.filename
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Photo file not found")
+
     if not is_video_filename(photo.filename):
-        file_path = get_user_storage(user.id) / photo.filename
-        if not file_path.is_file():
-            raise HTTPException(status_code=404, detail="Photo file not found")
         return FileResponse(
             path=file_path,
             media_type=infer_mime_type(photo.original_filename, photo.mime_type),
             filename=photo.original_filename,
         )
 
-    file_path = ensure_stream_file(photo, user.id)
-    if file_path is None or not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Video file not found")
-
     file_size = file_path.stat().st_size
     range_header = request.headers.get("range")
-    media_type = "video/mp4" if file_path.suffix.lower() == ".mp4" else infer_mime_type(photo.original_filename, photo.mime_type)
+    media_type = infer_mime_type(photo.original_filename, photo.mime_type)
 
     if not range_header:
         headers = {
@@ -416,14 +343,11 @@ def permanently_delete_photo(
 
     file_path = get_user_storage(user.id) / photo.filename
     thumbnail_path = get_thumbnail_path(user.id, photo.filename)
-    stream_path = get_stream_path(user.id, photo.filename)
 
     if file_path.is_file():
         file_path.unlink()
     if thumbnail_path.is_file():
         thumbnail_path.unlink()
-    if stream_path.is_file():
-        stream_path.unlink()
 
     db.delete(photo)
     db.commit()
@@ -484,8 +408,6 @@ async def upload_photo(
     db.refresh(photo)
 
     ensure_thumbnail(photo, user.id)
-    if is_video_filename(photo.filename) and supports_faststart_remux(photo.filename):
-        ensure_stream_file(photo, user.id)
 
     return media_item(photo)
 
@@ -536,14 +458,11 @@ def cleanup_expired_trash(db: Session):
     for photo in photos:
         file_path = get_user_storage(photo.user_id) / photo.filename
         thumbnail_path = get_thumbnail_path(photo.user_id, photo.filename)
-        stream_path = get_stream_path(photo.user_id, photo.filename)
 
         if file_path.is_file():
             file_path.unlink()
         if thumbnail_path.is_file():
             thumbnail_path.unlink()
-        if stream_path.is_file():
-            stream_path.unlink()
 
         db.delete(photo)
         deleted_count += 1
