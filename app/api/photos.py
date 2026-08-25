@@ -1,21 +1,117 @@
 from io import BytesIO
 from datetime import datetime, timedelta
+from pathlib import Path
+import mimetypes
+import subprocess
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from PIL import Image
 
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
 from app.db.models import Photo, User
-from app.storage.service import generate_filename, get_user_storage, is_video_filename
+from app.storage.service import (
+    generate_filename,
+    get_thumbnail_path,
+    get_user_storage,
+    is_video_filename,
+)
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
 
-# Large media must be streamed to disk instead of loaded into RAM.
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1 GB
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
+def infer_mime_type(filename: str, supplied: str | None) -> str:
+    supplied = (supplied or "").strip().lower()
+    if supplied and supplied != "application/octet-stream":
+        return supplied
+
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+def generate_video_thumbnail(video_path: Path, thumbnail_path: Path) -> bool:
+    """Generate one JPEG frame using ffmpeg. Failure does not fail the upload."""
+    thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if thumbnail_path.is_file() and thumbnail_path.stat().st_size > 0:
+        return True
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                "0.5",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=400:-2",
+                "-q:v",
+                "4",
+                str(thumbnail_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        return result.returncode == 0 and thumbnail_path.is_file()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def generate_image_thumbnail(image_path: Path, thumbnail_path: Path) -> bool:
+    try:
+        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.open(image_path)
+        image.thumbnail((400, 400))
+        output = BytesIO()
+
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+
+        image.save(output, format="JPEG", quality=80)
+        thumbnail_path.write_bytes(output.getvalue())
+        return True
+    except Exception:
+        return False
+
+
+def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
+    file_path = get_user_storage(user_id) / photo.filename
+    thumbnail_path = get_thumbnail_path(user_id, photo.filename)
+
+    if not file_path.is_file():
+        return None
+
+    if thumbnail_path.is_file() and thumbnail_path.stat().st_size > 0:
+        return thumbnail_path
+
+    if is_video_filename(photo.filename):
+        return thumbnail_path if generate_video_thumbnail(file_path, thumbnail_path) else None
+
+    return thumbnail_path if generate_image_thumbnail(file_path, thumbnail_path) else None
+
+
+def media_item(photo: Photo) -> dict:
+    return {
+        "id": photo.id,
+        "filename": photo.filename,
+        "original_filename": photo.original_filename,
+        "mime_type": photo.mime_type,
+        "size": photo.file_size,
+        "uploaded_at": photo.uploaded_at,
+        "thumbnail_url": f"/photos/{photo.id}/thumbnail",
+    }
 
 
 @router.get("")
@@ -29,18 +125,7 @@ def list_photos(
         .order_by(Photo.uploaded_at.desc())
         .all()
     )
-
-    return [
-        {
-            "id": photo.id,
-            "filename": photo.filename,
-            "original_filename": photo.original_filename,
-            "mime_type": photo.mime_type,
-            "size": photo.file_size,
-            "uploaded_at": photo.uploaded_at,
-        }
-        for photo in photos
-    ]
+    return [media_item(photo) for photo in photos]
 
 
 @router.get("/recent")
@@ -55,22 +140,7 @@ def list_recent_photos(
         .limit(50)
         .all()
     )
-
-    return [
-        {
-            "id": photo.id,
-            "original_filename": photo.original_filename,
-            "mime_type": photo.mime_type,
-            "size": photo.file_size,
-            "uploaded_at": photo.uploaded_at,
-            "thumbnail_url": (
-                None
-                if is_video_filename(photo.filename)
-                else f"/photos/{photo.id}/thumbnail"
-            ),
-        }
-        for photo in photos
-    ]
+    return [media_item(photo) for photo in photos]
 
 
 @router.get("/{photo_id}/thumbnail")
@@ -79,8 +149,6 @@ def get_photo_thumbnail(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Thumbnails are also needed by the Trash screen, so deliberately do not
-    # filter on deleted_at here. Authorization is still enforced by user_id.
     photo = (
         db.query(Photo)
         .filter(Photo.id == photo_id, Photo.user_id == user.id)
@@ -90,31 +158,14 @@ def get_photo_thumbnail(
     if photo is None:
         raise HTTPException(status_code=404, detail="Photo not found")
 
-    if is_video_filename(photo.filename):
+    thumbnail_path = ensure_thumbnail(photo, user.id)
+    if thumbnail_path is None:
         raise HTTPException(
-            status_code=415,
-            detail="Video thumbnails are not generated yet",
+            status_code=503,
+            detail="Unable to generate media thumbnail. Install ffmpeg for video thumbnails.",
         )
 
-    file_path = get_user_storage(user.id) / photo.filename
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Photo file not found")
-
-    try:
-        image = Image.open(file_path)
-        image.thumbnail((400, 400))
-        output = BytesIO()
-
-        if image.mode not in ("RGB", "L"):
-            image = image.convert("RGB")
-
-        image.save(output, format="JPEG", quality=80)
-        output.seek(0)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Unable to generate thumbnail")
-
-    return StreamingResponse(output, media_type="image/jpeg")
+    return FileResponse(path=thumbnail_path, media_type="image/jpeg")
 
 
 @router.get("/trash")
@@ -131,21 +182,11 @@ def list_trash(
 
     return [
         {
-            "id": photo.id,
-            "filename": photo.filename,
-            "original_filename": photo.original_filename,
-            "mime_type": photo.mime_type,
-            "size": photo.file_size,
-            "uploaded_at": photo.uploaded_at,
+            **media_item(photo),
             "deleted_at": photo.deleted_at,
             "days_remaining": max(
                 0,
                 30 - (datetime.utcnow() - photo.deleted_at).days,
-            ),
-            "thumbnail_url": (
-                None
-                if is_video_filename(photo.filename)
-                else f"/photos/{photo.id}/thumbnail"
             ),
         }
         for photo in photos
@@ -153,8 +194,9 @@ def list_trash(
 
 
 @router.get("/{photo_id}")
-def get_photo(
+async def get_photo(
     photo_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -172,15 +214,85 @@ def get_photo(
         raise HTTPException(status_code=404, detail="Photo not found")
 
     file_path = get_user_storage(user.id) / photo.filename
-
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Photo file not found")
 
-    return FileResponse(
-        path=file_path,
-        media_type=photo.mime_type,
-        filename=photo.original_filename,
+    if not is_video_filename(photo.filename):
+        return FileResponse(
+            path=file_path,
+            media_type=photo.mime_type,
+            filename=photo.original_filename,
+        )
+
+    # Video playback needs byte ranges so Android video_player can seek and
+    # start playback without downloading the entire file first.
+    file_size = file_path.stat().st_size
+    range_header = request.headers.get("range")
+    media_type = infer_mime_type(photo.original_filename, photo.mime_type)
+
+    if not range_header:
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Disposition": f'inline; filename="{photo.original_filename}"',
+        }
+        return StreamingResponse(
+            _file_iterator(file_path, 0, file_size - 1),
+            status_code=200,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    if not range_header.startswith("bytes="):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    try:
+        range_value = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+        start_text, end_text = range_value.split("-", 1)
+
+        if start_text == "":
+            suffix_length = int(end_text)
+            if suffix_length <= 0:
+                raise ValueError
+            start = max(0, file_size - suffix_length)
+            end = file_size - 1
+        else:
+            start = int(start_text)
+            end = int(end_text) if end_text else file_size - 1
+            if start < 0 or start >= file_size:
+                raise ValueError
+            end = min(end, file_size - 1)
+            if end < start:
+                raise ValueError
+    except (ValueError, TypeError):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    content_length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(content_length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Disposition": f'inline; filename="{photo.original_filename}"',
+    }
+
+    return StreamingResponse(
+        _file_iterator(file_path, start, end),
+        status_code=206,
+        media_type=media_type,
+        headers=headers,
     )
+
+
+def _file_iterator(path: Path, start: int, end: int):
+    with path.open("rb") as file:
+        file.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = file.read(min(STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
 
 
 @router.post("/trash/{photo_id}/restore")
@@ -205,7 +317,6 @@ def restore_photo(
     photo.deleted_at = None
     db.commit()
     db.refresh(photo)
-
     return {"message": "Photo restored successfully", "id": photo.id}
 
 
@@ -229,12 +340,15 @@ def permanently_delete_photo(
         raise HTTPException(status_code=404, detail="Photo not found in trash")
 
     file_path = get_user_storage(user.id) / photo.filename
+    thumbnail_path = get_thumbnail_path(user.id, photo.filename)
+
     if file_path.is_file():
         file_path.unlink()
+    if thumbnail_path.is_file():
+        thumbnail_path.unlink()
 
     db.delete(photo)
     db.commit()
-
     return {"message": "Photo permanently deleted", "id": photo_id}
 
 
@@ -283,7 +397,7 @@ async def upload_photo(
         user_id=user.id,
         filename=filename,
         original_filename=file.filename or filename,
-        mime_type=file.content_type or "application/octet-stream",
+        mime_type=infer_mime_type(file.filename or filename, file.content_type),
         file_size=total_size,
     )
 
@@ -291,13 +405,12 @@ async def upload_photo(
     db.commit()
     db.refresh(photo)
 
-    return {
-        "id": photo.id,
-        "filename": photo.filename,
-        "original_filename": photo.original_filename,
-        "mime_type": photo.mime_type,
-        "size": photo.file_size,
-    }
+    # Generate the thumbnail after the original is safely stored. A missing
+    # ffmpeg installation does not make the upload itself fail; the thumbnail
+    # endpoint will retry generation later.
+    ensure_thumbnail(photo, user.id)
+
+    return media_item(photo)
 
 
 @router.delete("/{photo_id}")
@@ -345,9 +458,12 @@ def cleanup_expired_trash(db: Session):
 
     for photo in photos:
         file_path = get_user_storage(photo.user_id) / photo.filename
+        thumbnail_path = get_thumbnail_path(photo.user_id, photo.filename)
 
         if file_path.is_file():
             file_path.unlink()
+        if thumbnail_path.is_file():
+            thumbnail_path.unlink()
 
         db.delete(photo)
         deleted_count += 1
