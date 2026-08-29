@@ -4,7 +4,7 @@ from pathlib import Path
 import mimetypes
 import subprocess
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from PIL import Image
@@ -12,7 +12,6 @@ from PIL import Image
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
 from app.db.models import Photo, User, VideoVariant
-from app.services.video_processing import PLAYBACK_VARIANT, process_video_variant
 from app.storage.service import generate_filename, get_thumbnail_path, get_user_storage, get_variant_path, is_video_filename
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
@@ -65,6 +64,9 @@ def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
     if is_video_filename(photo.filename):
         return thumbnail_path if generate_video_thumbnail(file_path, thumbnail_path) else None
     return thumbnail_path if generate_image_thumbnail(file_path, thumbnail_path) else None
+
+
+PLAYBACK_VARIANT = "1080p"
 
 
 def media_item(photo: Photo, db: Session | None = None) -> dict:
@@ -206,13 +208,16 @@ def permanently_delete_photo(photo_id: int, user: User = Depends(get_current_use
     thumbnail_path = get_thumbnail_path(user.id, photo.filename)
     if file_path.is_file(): file_path.unlink()
     if thumbnail_path.is_file(): thumbnail_path.unlink()
+    for variant in list(photo.video_variants):
+        variant_path = get_variant_path(user.id, variant.filename) if variant.filename else None
+        if variant_path and variant_path.is_file(): variant_path.unlink()
     db.delete(photo)
     db.commit()
     return {"message": "Photo permanently deleted", "id": photo_id}
 
 
 @router.post("/upload")
-async def upload_photo(background_tasks: BackgroundTasks, file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def upload_photo(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
         filename = generate_filename(file.filename or "")
     except ValueError as exc:
@@ -245,35 +250,4 @@ async def upload_photo(background_tasks: BackgroundTasks, file: UploadFile = Fil
     db.refresh(photo)
     ensure_thumbnail(photo, user.id)
 
-    if is_video_filename(filename):
-        variant = VideoVariant(photo_id=photo.id, variant_type=PLAYBACK_VARIANT, mime_type="video/mp4", status="processing")
-        db.add(variant)
-        db.commit()
-        background_tasks.add_task(process_video_variant, photo.id, user.id)
-
     return media_item(photo, db)
-
-
-@router.delete("/{photo_id}")
-def delete_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    photo = db.query(Photo).filter(Photo.id == photo_id, Photo.user_id == user.id, Photo.deleted_at.is_(None)).first()
-    if photo is None:
-        raise HTTPException(status_code=404, detail="Photo not found")
-    photo.deleted_at = datetime.utcnow()
-    db.commit()
-    return {"message": "Photo moved to trash", "id": photo_id, "deleted_at": photo.deleted_at}
-
-
-def cleanup_expired_trash(db: Session):
-    cutoff = datetime.utcnow() - timedelta(days=30)
-    photos = db.query(Photo).filter(Photo.deleted_at.isnot(None), Photo.deleted_at <= cutoff).all()
-    deleted_count = 0
-    for photo in photos:
-        file_path = get_user_storage(photo.user_id) / photo.filename
-        thumbnail_path = get_thumbnail_path(photo.user_id, photo.filename)
-        if file_path.is_file(): file_path.unlink()
-        if thumbnail_path.is_file(): thumbnail_path.unlink()
-        db.delete(photo)
-        deleted_count += 1
-    db.commit()
-    return deleted_count
