@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.database import Base
@@ -90,6 +90,78 @@ class Photo(Base):
     album_photos: Mapped[list["AlbumPhoto"]] = relationship(
         back_populates="photo",
         cascade="all, delete-orphan",
+    )
+
+    video_variants: Mapped[list["VideoVariant"]] = relationship(
+        back_populates="photo",
+        cascade="all, delete-orphan",
+    )
+
+
+class VideoVariant(Base):
+    __tablename__ = "video_variants"
+    __table_args__ = (
+        UniqueConstraint("photo_id", "variant_type", name="uq_video_variant_photo_type"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    photo_id: Mapped[int] = mapped_column(
+        ForeignKey("photos.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    variant_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+    )
+
+    filename: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
+
+    mime_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default="video/mp4",
+    )
+
+    file_size: Mapped[int | None] = mapped_column(
+        nullable=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="processing",
+    )
+
+    error_message: Mapped[str | None] = mapped_column(
+        String(1000),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    photo: Mapped["Photo"] = relationship(
+        back_populates="video_variants",
     )
 
 
