@@ -18,6 +18,7 @@ router = APIRouter(prefix="/photos", tags=["Photos"])
 MAX_FILE_SIZE = 1024 * 1024 * 1024
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 STREAM_CHUNK_SIZE = 1024 * 1024
+PLAYBACK_VARIANT = "1080p"
 
 
 def infer_mime_type(filename: str, supplied: str | None) -> str:
@@ -66,9 +67,6 @@ def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
     return thumbnail_path if generate_image_thumbnail(file_path, thumbnail_path) else None
 
 
-PLAYBACK_VARIANT = "1080p"
-
-
 def media_item(photo: Photo, db: Session | None = None) -> dict:
     item = {
         "id": photo.id,
@@ -81,10 +79,7 @@ def media_item(photo: Photo, db: Session | None = None) -> dict:
     }
     if is_video_filename(photo.filename) and db is not None:
         variant = db.query(VideoVariant).filter(VideoVariant.photo_id == photo.id, VideoVariant.variant_type == PLAYBACK_VARIANT).first()
-        item["playback"] = {
-            "status": variant.status if variant else "pending",
-            "url": f"/photos/{photo.id}/playback" if variant and variant.status == "ready" else None,
-        }
+        item["playback"] = {"status": variant.status if variant else "pending", "url": f"/photos/{photo.id}/playback" if variant and variant.status == "ready" else None}
     return item
 
 
@@ -159,17 +154,14 @@ def _range_response(request: Request, file_path: Path, media_type: str, filename
         start_text, end_text = value.split("-", 1)
         if start_text == "":
             suffix = int(end_text)
-            if suffix <= 0:
-                raise ValueError
+            if suffix <= 0: raise ValueError
             start, end = max(0, file_size - suffix), file_size - 1
         else:
             start = int(start_text)
             end = int(end_text) if end_text else file_size - 1
-            if start < 0 or start >= file_size:
-                raise ValueError
+            if start < 0 or start >= file_size: raise ValueError
             end = min(end, file_size - 1)
-            if end < start:
-                raise ValueError
+            if end < start: raise ValueError
     except (ValueError, TypeError):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
     length = end - start + 1
@@ -182,8 +174,7 @@ def _file_iterator(path: Path, start: int, end: int):
         remaining = end - start + 1
         while remaining > 0:
             chunk = file.read(min(STREAM_CHUNK_SIZE, remaining))
-            if not chunk:
-                break
+            if not chunk: break
             remaining -= len(chunk)
             yield chunk
 
@@ -191,8 +182,7 @@ def _file_iterator(path: Path, start: int, end: int):
 @router.post("/trash/{photo_id}/restore")
 def restore_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     photo = db.query(Photo).filter(Photo.id == photo_id, Photo.user_id == user.id, Photo.deleted_at.isnot(None)).first()
-    if photo is None:
-        raise HTTPException(status_code=404, detail="Photo not found in trash")
+    if photo is None: raise HTTPException(status_code=404, detail="Photo not found in trash")
     photo.deleted_at = None
     db.commit()
     db.refresh(photo)
@@ -202,8 +192,7 @@ def restore_photo(photo_id: int, user: User = Depends(get_current_user), db: Ses
 @router.delete("/trash/{photo_id}")
 def permanently_delete_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     photo = db.query(Photo).filter(Photo.id == photo_id, Photo.user_id == user.id, Photo.deleted_at.isnot(None)).first()
-    if photo is None:
-        raise HTTPException(status_code=404, detail="Photo not found in trash")
+    if photo is None: raise HTTPException(status_code=404, detail="Photo not found in trash")
     file_path = get_user_storage(user.id) / photo.filename
     thumbnail_path = get_thumbnail_path(user.id, photo.filename)
     if file_path.is_file(): file_path.unlink()
@@ -222,15 +211,13 @@ async def upload_photo(file: UploadFile = File(...), user: User = Depends(get_cu
         filename = generate_filename(file.filename or "")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
     file_path = get_user_storage(user.id) / filename
     total_size = 0
     try:
         with file_path.open("wb") as output:
             while True:
                 chunk = await file.read(UPLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
+                if not chunk: break
                 total_size += len(chunk)
                 if total_size > MAX_FILE_SIZE:
                     raise HTTPException(status_code=413, detail="File too large. Maximum size is 1 GB.")
@@ -243,11 +230,36 @@ async def upload_photo(file: UploadFile = File(...), user: User = Depends(get_cu
         raise HTTPException(status_code=500, detail="Failed to store uploaded file")
     finally:
         await file.close()
-
     photo = Photo(user_id=user.id, filename=filename, original_filename=file.filename or filename, mime_type=infer_mime_type(file.filename or filename, file.content_type), file_size=total_size)
     db.add(photo)
     db.commit()
     db.refresh(photo)
     ensure_thumbnail(photo, user.id)
-
     return media_item(photo, db)
+
+
+@router.delete("/{photo_id}")
+def delete_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    photo = db.query(Photo).filter(Photo.id == photo_id, Photo.user_id == user.id, Photo.deleted_at.is_(None)).first()
+    if photo is None: raise HTTPException(status_code=404, detail="Photo not found")
+    photo.deleted_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Photo moved to trash", "id": photo_id, "deleted_at": photo.deleted_at}
+
+
+def cleanup_expired_trash(db: Session):
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    photos = db.query(Photo).filter(Photo.deleted_at.isnot(None), Photo.deleted_at <= cutoff).all()
+    deleted_count = 0
+    for photo in photos:
+        file_path = get_user_storage(photo.user_id) / photo.filename
+        thumbnail_path = get_thumbnail_path(photo.user_id, photo.filename)
+        if file_path.is_file(): file_path.unlink()
+        if thumbnail_path.is_file(): thumbnail_path.unlink()
+        for variant in list(photo.video_variants):
+            variant_path = get_variant_path(photo.user_id, variant.filename) if variant.filename else None
+            if variant_path and variant_path.is_file(): variant_path.unlink()
+        db.delete(photo)
+        deleted_count += 1
+    db.commit()
+    return deleted_count
