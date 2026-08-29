@@ -1,7 +1,7 @@
 """add video variants table
 
 Revision ID: 7a1f3c9d2b44
-Revises: c6e1c237edbe
+Revises: 2fb0d91560b7
 Create Date: 2026-08-29
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "7a1f3c9d2b44"
-down_revision: Union[str, Sequence[str], None] = "c6e1c237edbe"
+down_revision: Union[str, Sequence[str], None] = "2fb0d91560b7"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
