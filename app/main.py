@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.routes import router as auth_router
 from app.api.photos import router as photos_router
+from app.api.video_upload import router as video_upload_router
 from app.api.albums import router as albums_router
 from app.api.photos import cleanup_expired_trash
 from app.db.database import Base, engine, SessionLocal
@@ -15,7 +16,7 @@ from app.db import models
 Base.metadata.create_all(bind=engine)
 
 
-TRASH_CLEANUP_INTERVAL = 24 * 60 * 60  # once per day
+TRASH_CLEANUP_INTERVAL = 24 * 60 * 60
 
 
 async def _trash_cleanup_loop():
@@ -31,7 +32,6 @@ async def _trash_cleanup_loop():
                     f"{deleted_count} expired photo(s)."
                 )
         except Exception as exc:
-            # A cleanup failure must never bring down the API server.
             print(f"Trash cleanup failed: {exc}")
         finally:
             db.close()
@@ -39,7 +39,6 @@ async def _trash_cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Clean up anything that expired while the server was offline.
     db: Session = SessionLocal()
     try:
         deleted_count = cleanup_expired_trash(db)
@@ -70,6 +69,7 @@ app = FastAPI(
 
 app.include_router(auth_router)
 app.include_router(photos_router)
+app.include_router(video_upload_router)
 app.include_router(albums_router)
 
 
