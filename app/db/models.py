@@ -36,6 +36,11 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    favorites: Mapped[list["Favorite"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
 
 class Photo(Base):
     __tablename__ = "photos"
@@ -95,6 +100,39 @@ class Photo(Base):
     video_variants: Mapped[list["VideoVariant"]] = relationship(
         back_populates="photo",
         cascade="all, delete-orphan",
+    )
+
+    favorite_entries: Mapped[list["Favorite"]] = relationship(
+        back_populates="photo",
+        cascade="all, delete-orphan",
+    )
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    photo_id: Mapped[int] = mapped_column(
+        ForeignKey("photos.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="favorites",
+    )
+
+    photo: Mapped["Photo"] = relationship(
+        back_populates="favorite_entries",
     )
 
 
