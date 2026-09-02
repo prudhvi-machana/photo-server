@@ -11,7 +11,7 @@ from PIL import Image
 
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
-from app.db.models import Photo, User, VideoVariant
+from app.db.models import Favorite, Photo, User, VideoVariant
 from app.storage.service import generate_filename, get_thumbnail_path, get_user_storage, get_variant_path, is_video_filename
 
 router = APIRouter(prefix="/photos", tags=["Photos"])
@@ -67,7 +67,7 @@ def ensure_thumbnail(photo: Photo, user_id: int) -> Path | None:
     return thumbnail_path if generate_image_thumbnail(file_path, thumbnail_path) else None
 
 
-def media_item(photo: Photo, db: Session | None = None) -> dict:
+def media_item(photo: Photo, db: Session | None = None, user_id: int | None = None) -> dict:
     item = {
         "id": photo.id,
         "filename": photo.filename,
@@ -76,7 +76,13 @@ def media_item(photo: Photo, db: Session | None = None) -> dict:
         "size": photo.file_size,
         "uploaded_at": photo.uploaded_at,
         "thumbnail_url": f"/photos/{photo.id}/thumbnail",
+        "is_favorite": False,
     }
+    if db is not None and user_id is not None:
+        item["is_favorite"] = db.query(Favorite).filter(
+            Favorite.user_id == user_id,
+            Favorite.photo_id == photo.id,
+        ).first() is not None
     if is_video_filename(photo.filename) and db is not None:
         variant = db.query(VideoVariant).filter(VideoVariant.photo_id == photo.id, VideoVariant.variant_type == PLAYBACK_VARIANT).first()
         item["playback"] = {"status": variant.status if variant else "pending", "url": f"/photos/{photo.id}/playback" if variant and variant.status == "ready" else None}
@@ -86,13 +92,67 @@ def media_item(photo: Photo, db: Session | None = None) -> dict:
 @router.get("")
 def list_photos(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     photos = db.query(Photo).filter(Photo.user_id == user.id, Photo.deleted_at.is_(None)).order_by(Photo.uploaded_at.desc()).all()
-    return [media_item(photo, db) for photo in photos]
+    return [media_item(photo, db, user.id) for photo in photos]
 
 
 @router.get("/recent")
 def list_recent_photos(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     photos = db.query(Photo).filter(Photo.user_id == user.id, Photo.deleted_at.is_(None)).order_by(Photo.uploaded_at.desc()).limit(50).all()
-    return [media_item(photo, db) for photo in photos]
+    return [media_item(photo, db, user.id) for photo in photos]
+
+
+@router.get("/favorites")
+def list_favorite_photos(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    favorites = (
+        db.query(Favorite)
+        .join(Photo, Photo.id == Favorite.photo_id)
+        .filter(
+            Favorite.user_id == user.id,
+            Photo.user_id == user.id,
+            Photo.deleted_at.is_(None),
+        )
+        .order_by(Favorite.created_at.desc())
+        .all()
+    )
+    return [media_item(favorite.photo, db, user.id) for favorite in favorites]
+
+
+@router.post("/{photo_id}/favorite")
+def favorite_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    photo = db.query(Photo).filter(
+        Photo.id == photo_id,
+        Photo.user_id == user.id,
+        Photo.deleted_at.is_(None),
+    ).first()
+    if photo is None:
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    existing = db.query(Favorite).filter(
+        Favorite.user_id == user.id,
+        Favorite.photo_id == photo_id,
+    ).first()
+    if existing is None:
+        db.add(Favorite(user_id=user.id, photo_id=photo_id))
+        db.commit()
+
+    return {"id": photo_id, "is_favorite": True}
+
+
+@router.delete("/{photo_id}/favorite")
+def unfavorite_photo(photo_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    photo = db.query(Photo).filter(Photo.id == photo_id, Photo.user_id == user.id).first()
+    if photo is None:
+        raise HTTPException(status_code=404, detail="Photo not found")
+
+    favorite = db.query(Favorite).filter(
+        Favorite.user_id == user.id,
+        Favorite.photo_id == photo_id,
+    ).first()
+    if favorite is not None:
+        db.delete(favorite)
+        db.commit()
+
+    return {"id": photo_id, "is_favorite": False}
 
 
 @router.get("/{photo_id}/thumbnail")
@@ -109,7 +169,7 @@ def get_photo_thumbnail(photo_id: int, user: User = Depends(get_current_user), d
 @router.get("/trash")
 def list_trash(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     photos = db.query(Photo).filter(Photo.user_id == user.id, Photo.deleted_at.isnot(None)).order_by(Photo.deleted_at.desc()).all()
-    return [{**media_item(photo, db), "deleted_at": photo.deleted_at, "days_remaining": max(0, 30 - (datetime.utcnow() - photo.deleted_at).days)} for photo in photos]
+    return [{**media_item(photo, db, user.id), "deleted_at": photo.deleted_at, "days_remaining": max(0, 30 - (datetime.utcnow() - photo.deleted_at).days)} for photo in photos]
 
 
 @router.get("/{photo_id}/playback")
@@ -235,7 +295,7 @@ async def upload_photo(file: UploadFile = File(...), user: User = Depends(get_cu
     db.commit()
     db.refresh(photo)
     ensure_thumbnail(photo, user.id)
-    return media_item(photo, db)
+    return media_item(photo, db, user.id)
 
 
 @router.delete("/{photo_id}")
