@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
 from app.db.database import get_db
-from app.db.models import Album, AlbumPhoto, Photo, User
+from app.db.models import Album, AlbumPhoto, Favorite, Photo, User
 from app.storage.service import is_video_filename
 
 router = APIRouter(prefix="/albums", tags=["Albums"])
@@ -144,6 +144,10 @@ def list_album_photos(album_id: int, user: User = Depends(get_current_user), db:
             "size": photo.file_size,
             "uploaded_at": photo.uploaded_at,
             "thumbnail_url": None if is_video_filename(photo.filename) else f"/photos/{photo.id}/thumbnail",
+            "is_favorite": db.query(Favorite).filter(
+                Favorite.user_id == user.id,
+                Favorite.photo_id == photo.id,
+            ).first() is not None,
         }
         for photo in photos
     ]
